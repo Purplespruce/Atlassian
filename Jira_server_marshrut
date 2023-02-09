@@ -1,0 +1,141 @@
+import com.atlassian.jira.bc.issue.IssueService
+import com.atlassian.jira.component.ComponentAccessor
+import com.atlassian.servicedesk.api.requesttype.RequestTypeService
+import com.atlassian.jira.bc.user.search.UserSearchService
+import com.atlassian.jira.event.type.EventDispatchOption
+import com.atlassian.jira.issue.CustomFieldManager
+import static com.atlassian.jira.issue.IssueFieldConstants.*
+import com.atlassian.jira.issue.search.SearchResults
+import com.atlassian.mail.Email
+import com.atlassian.mail.server.SMTPMailServer
+
+import com.atlassian.jira.bc.issue.search.SearchService
+import com.atlassian.jira.jql.parser.JqlQueryParser
+import com.atlassian.jira.web.bean.PagerFilter
+import com.atlassian.jira.issue.link.IssueLinkTypeManager
+
+import com.atlassian.mail.Email
+import com.atlassian.mail.MailException
+import com.atlassian.mail.server.SMTPMailServer
+import com.atlassian.plugin.util.ContextClassLoaderSwitchingUtil
+import com.atlassian.jira.mail.settings.MailSettings
+
+def issueManager = ComponentAccessor.issueManager
+def requestTypeService = ComponentAccessor.getOSGiComponentInstanceOfType(RequestTypeService)
+def customFieldManager = ComponentAccessor.getCustomFieldManager();
+def userSearchService = ComponentAccessor.getComponent(UserSearchService)
+IssueService issueService = ComponentAccessor.getIssueService()
+def jqlQueryParser = ComponentAccessor.getComponent(JqlQueryParser)
+def searchService = ComponentAccessor.getComponent(SearchService)
+def issueLinkTypeManager = ComponentAccessor.getComponent(IssueLinkTypeManager)
+def availableIssueLinkTypes = issueLinkTypeManager.issueLinkTypes
+SMTPMailServer mailServer = ComponentAccessor.getMailServerManager().getDefaultSMTPMailServer()
+
+def issue = issueManager.getIssueObject("SD-215879")
+def currentUser = ComponentAccessor.getJiraAuthenticationContext().getLoggedInUser()
+def requestType
+def teamToAssign
+def Closing
+def newParOptionCat
+def newChildOptionCat
+def LinkIssueKey
+
+final String issueLinkName = "Дубликат"
+final Long sequence = 1L
+
+try {
+    def reqQ = requestTypeService.newQueryBuilder().issue(issue.id).build()
+	def reqT = requestTypeService.getRequestTypes(currentUser, reqQ)
+	//requestType = reqT.right.results[0].getName() //Получаем название услуги
+	requestType = reqT.getResults()[0].getName()   /// my change for new version
+    log.debug "назначение requestType ==$requestType "
+}catch(Exception ex) {
+    requestType="Empty"
+}
+
+
+
+if (requestType == "Письмо") {
+    if (issue.summary.toLowerCase().contains("приближение к квоте  ")){
+        log.debug issue.summary
+		teamToAssign="1Л" 
+		newParOptionCat = "Регламентные работы"
+		newChildOptionCat = "Запрос.Почта"
+        //Closing = "Решено"
+		String summ = issue.summary.toLowerCase()
+		def emailAddr = summ.replace("приближение к квоте  ", "")
+		def user = userSearchService.findUsersByEmail(emailAddr)[0]
+		if(user){
+			issue.setReporter(user)
+        }
+        def jql = "summary ~ '${issue.summary}' ORDER BY key ASC"
+		def issues = ComponentAccessor.getComponent(SearchService).search(currentUser, ComponentAccessor.getComponent(JqlQueryParser).parseQuery(jql), PagerFilter.getUnlimitedFilter())
+        //def results = searchProvider.search(query, currentUser, PagerFilter.getUnlimitedFilter()) as SearchResults<Issue>
+            log.debug("issues found: ${issues.total}")
+
+		if (issues.total != 1) {
+            LinkIssueKey = issues.results.first().key
+            log.info issue.id
+            
+            def LinkIssue = issueManager.getIssueObject("${LinkIssueKey}")
+			log.info LinkIssue.id
+
+			def linkType = availableIssueLinkTypes.findByName(issueLinkName)
+            log.info linkType
+            ComponentAccessor.issueLinkManager.createIssueLink(issue.id, LinkIssue.id, linkType.id, sequence, currentUser)
+        		
+            def subject = "test"
+            def body= """
+                Почему это произошло? 
+                <br/><br/>
+			"""
+            log.info emailAddr
+			sendEmail(emailAddr, subject, body)
+        
+        }else{
+			def subject = "test"
+            def body= """
+                    Добрый день!
+                    <br>
+                    Согласно информации, поступившей нам с сервера мониторинга, оценивающего состояние почтовых ящиков корпоративной сети, на вашем почтовом ящике заканчивается свободное место. 
+                    <br>
+                    Решить эту проблему можно настроив автоматическую архивацию почтового ящика.
+                    <br>
+                    Инструкция ""Автоматическая архивация писем"" доступна по ссылке: https://docs.etalongroup.com/pages/viewpage.action?pageId=17040343
+                    <br>
+                    Также обязательно необходимо очистить папку ""Ошибки синхронизации"".
+                    <br>
+                    Как это сделать описано в инструкции: https://docs.etalongroup.com/pages/viewpage.action?pageId=61538524
+                    <br>
+                    Если у Вас возникнут вопросы или затруднения, сообщите нам об этом ответным письмом.
+                    <br>
+                    Спасибо.
+
+			"""
+            log.info emailAddr
+			sendEmail(emailAddr, subject, body)
+        }
+    }
+
+}
+
+def cfClosing = customFieldManager.getCustomFieldObject(10510)
+def ClosingfieldConfig = cfClosing.getRelevantConfig(issue)
+def cfClosingValue = issue.getCustomFieldValue(cfClosing);
+
+if (Closing){
+    def value = ComponentAccessor.optionsManager.getOptions(ClosingfieldConfig)?.find { it.toString() == Closing }
+    issue.setCustomFieldValue(cfClosing, value); // Устанавливаем значение поля Team в соответствии с ответственной команды
+    ComponentAccessor.getIssueManager().updateIssue(currentUser, issue, EventDispatchOption.DO_NOT_DISPATCH, false)  //Сохраняем изменения
+}
+
+
+//sendEmail('andrey.permyakov@etalongroup.com', '<MAIL_SUBJECT>', '<MAIL_BODY>')	
+def sendEmail(String emailAddr, String subject, String body) {
+    Email email = new Email(emailAddr)
+    email.setSubject(subject)
+    email.setBody(body)
+    email.setMimeType("text/html")
+    SMTPMailServer mailServer = ComponentAccessor.getMailServerManager().getDefaultSMTPMailServer()
+    mailServer.send(email)
+}
